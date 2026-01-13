@@ -1,0 +1,3 @@
+# Netscape HTTP Cookie File
+
+open.spotify.com	FALSE	/episode	FALSE	0	sss	1
