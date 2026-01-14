@@ -1,0 +1,19 @@
+{
+  "name": "spotify-podcast-downloader",
+  "version": "1.0.0",
+  "description": "Download podcast episodes from Spotify URLs via iTunes RSS lookup",
+  "type": "module",
+  "main": "spotifyDownloader.js",
+  "exports": {
+    ".": "./spotifyDownloader.js"
+  },
+  "scripts": {
+    "download": "node -e \"import('./spotifyDownloader.js').then(m => m.downloadSpotifyEpisode(process.argv[1], './downloads').then(console.log))\""
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  },
+  "peerDependencies": {
+    "podcast-dl": "*"
+  }
+}
