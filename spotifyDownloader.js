@@ -172,7 +172,7 @@ export async function downloadSpotifyEpisode(spotifyUrl, outputDir) {
     let episodeFilter = null;
 
     if (spotifyInfo.type === 'episode') {
-        // Create regex filter from episode title
+        // Create exact match regex filter from episode title
         // Escape special regex characters
         episodeFilter = spotifyInfo.title.replace(/[[\].*^$()+?{|\\]/g, '\\$&');
     }
@@ -186,8 +186,23 @@ export async function downloadSpotifyEpisode(spotifyUrl, outputDir) {
     console.log(`[SpotifyDownloader] Found RSS feed: ${itunesResult.feedUrl}`);
     console.log(`[SpotifyDownloader] Podcast: ${itunesResult.collectionName}`);
 
-    // Step 4: Download from RSS feed
-    const downloadResult = await downloadFromRss(itunesResult.feedUrl, outputDir, episodeFilter);
+    // Step 4: Download from RSS feed (try exact match first)
+    let downloadResult = await downloadFromRss(itunesResult.feedUrl, outputDir, episodeFilter);
+
+    // Step 5: If exact match failed and this is an episode, try partial name matching
+    if (!downloadResult.success && spotifyInfo.type === 'episode') {
+        console.log(`[SpotifyDownloader] Exact match failed, trying partial name matching...`);
+
+        const words = spotifyInfo.title
+            .split(/[\s\-:,]+/)  // Split on common separators
+            .filter(word => word.length > 2)  // Skip very short words
+            .map(word => word.replace(/[[\].*^$()+?{|\\]/g, '\\$&'));  // Escape regex chars
+
+        if (words.length > 0) {
+            const partialFilter = `.*${words.join('.*')}.*`;
+            downloadResult = await downloadFromRss(itunesResult.feedUrl, outputDir, partialFilter);
+        }
+    }
 
     if (!downloadResult.success) {
         return downloadResult;
