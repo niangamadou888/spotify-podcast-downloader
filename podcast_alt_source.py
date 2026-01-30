@@ -667,6 +667,167 @@ def search_youtube(episode_title: str, show_name: str = None, target_duration: i
     return results[:10]
 
 
+def download_raiplaysound(url: str, output_name: str) -> bool:
+    """Download audio from RaiPlaySound page by extracting the relinker URL."""
+    print(f"[*] Extracting audio from RaiPlaySound page...")
+
+    try:
+        # Fetch the page to find the relinker URL
+        cmd = [
+            'curl', '-s', '-L',
+            '-H', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            url
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        html_content = result.stdout
+
+        if not html_content or len(html_content) < 1000:
+            print("[-] Failed to fetch RaiPlaySound page")
+            return False
+
+        # Look for relinker URL pattern
+        # Pattern: https://mediapolisvod.rai.it/relinker/relinkerServlet.htm?cont=...
+        relinker_match = re.search(
+            r'https://mediapolisvod\.rai\.it/relinker/relinkerServlet\.htm\?cont=[^"\'<>\s]+',
+            html_content
+        )
+
+        if not relinker_match:
+            print("[-] Could not find relinker URL in page")
+            return False
+
+        relinker_url = relinker_match.group(0)
+        print(f"[*] Found relinker URL: {relinker_url[:80]}...")
+
+        # Follow the relinker redirect to get the actual audio URL
+        cmd = [
+            'curl', '-sI', '-L',
+            '-H', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
+            relinker_url
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        headers = result.stdout
+
+        # Extract the final Location header or look for the actual audio URL
+        audio_url = None
+
+        # Check if there's a redirect to the audio file
+        location_matches = re.findall(r'location:\s*(https?://[^\s]+)', headers, re.IGNORECASE)
+        for loc in location_matches:
+            if any(ext in loc.lower() for ext in ['.mp3', '.m4a', '.aac', '.mp4']):
+                audio_url = loc
+                break
+
+        if not audio_url:
+            # Try direct download from relinker
+            audio_url = relinker_url
+
+        print(f"[*] Downloading audio: {audio_url[:80]}...")
+
+        # Download the audio file
+        output_file = f"{output_name}.mp3"
+        cmd = [
+            'curl', '-L', '-o', output_file,
+            '-H', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)',
+            '--progress-bar',
+            audio_url
+        ]
+
+        result = subprocess.run(cmd, timeout=600)
+        if result.returncode == 0:
+            # Verify file was downloaded
+            import os
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 10000:
+                print(f"[+] Saved to: {output_file}")
+                return True
+            else:
+                print("[-] Downloaded file is too small or missing")
+                return False
+        return False
+
+    except Exception as e:
+        print(f"[-] RaiPlaySound download error: {e}")
+        return False
+
+
+def extract_audio_from_page(url: str, output_name: str) -> bool:
+    """Try to extract and download audio from a podcast page by looking for common patterns."""
+    print(f"[*] Attempting to extract audio from page...")
+
+    try:
+        # Fetch the page
+        cmd = [
+            'curl', '-s', '-L',
+            '-H', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            '-H', 'Accept: text/html,application/xhtml+xml',
+            url
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        html_content = result.stdout
+
+        if not html_content or len(html_content) < 500:
+            print("[-] Failed to fetch page")
+            return False
+
+        audio_url = None
+
+        # Pattern 1: Direct audio file URLs (.mp3, .m4a, .ogg, etc.)
+        audio_patterns = [
+            r'https?://[^"\'<>\s]+\.mp3(?:\?[^"\'<>\s]*)?',
+            r'https?://[^"\'<>\s]+\.m4a(?:\?[^"\'<>\s]*)?',
+            r'https?://[^"\'<>\s]+\.ogg(?:\?[^"\'<>\s]*)?',
+            r'https?://[^"\'<>\s]+\.aac(?:\?[^"\'<>\s]*)?',
+        ]
+
+        for pattern in audio_patterns:
+            matches = re.findall(pattern, html_content)
+            # Filter out tiny files (icons, etc) and prefer longer URLs (more likely to be episode audio)
+            for match in matches:
+                # Skip obvious non-audio URLs
+                if any(skip in match.lower() for skip in ['icon', 'logo', 'thumb', 'image', 'avatar', 'artwork']):
+                    continue
+                audio_url = match
+                break
+            if audio_url:
+                break
+
+        # Pattern 2: enclosure URL in RSS-like data or JSON
+        if not audio_url:
+            enclosure_match = re.search(r'"enclosure"[:\s]*"(https?://[^"]+)"', html_content)
+            if enclosure_match:
+                audio_url = enclosure_match.group(1)
+
+        # Pattern 3: audio src attribute
+        if not audio_url:
+            audio_src_match = re.search(r'<audio[^>]+src=["\'](https?://[^"\']+)["\']', html_content)
+            if audio_src_match:
+                audio_url = audio_src_match.group(1)
+
+        # Pattern 4: source element inside audio tag
+        if not audio_url:
+            source_match = re.search(r'<source[^>]+src=["\'](https?://[^"\']+\.(?:mp3|m4a|ogg))["\']', html_content)
+            if source_match:
+                audio_url = source_match.group(1)
+
+        # Pattern 5: data-audio or data-url attributes
+        if not audio_url:
+            data_audio_match = re.search(r'data-(?:audio|url|src)=["\'](https?://[^"\']+\.(?:mp3|m4a|ogg)[^"\']*)["\']', html_content)
+            if data_audio_match:
+                audio_url = data_audio_match.group(1)
+
+        if audio_url:
+            print(f"[+] Found audio URL: {audio_url[:80]}...")
+            return download_direct_audio(audio_url, output_name)
+        else:
+            print("[-] Could not extract audio URL from page")
+            print(f"[*] You may need to visit the page manually: {url}")
+            return False
+
+    except Exception as e:
+        print(f"[-] Error extracting audio: {e}")
+        return False
+
+
 def download_direct_audio(url: str, output_name: str) -> bool:
     """Download audio directly using curl (for direct audio URLs)."""
     print(f"[*] Downloading direct audio from: {url}")
@@ -1076,12 +1237,22 @@ Supported platforms (all free, no API keys):
         any(ext in url_to_download.lower() for ext in ['.mp3', '.m4a', '.mp4', '.aac', '.ogg'])
     )
 
-    if is_direct_audio:
+    if download_source['platform'] == 'raiplaysound':
+        # RaiPlaySound needs special handling to extract audio URL
+        success = download_raiplaysound(url_to_download, output_name)
+    elif download_source['platform'] == 'youtube':
+        # YouTube - use pytube (only platform that uses pytube)
+        if args.with_video:
+            success = download_video_with_subs(url_to_download, output_name)
+        else:
+            success = download_with_pytube(url_to_download, output_name)
+    elif is_direct_audio:
+        # Direct audio URL (e.g., from Fyyd)
         success = download_direct_audio(url_to_download, output_name)
-    elif download_source['platform'] == 'youtube' and args.with_video:
-        success = download_video_with_subs(url_to_download, output_name)
     else:
-        success = download_with_pytube(url_to_download, output_name)
+        # For other platforms (PodBean, Player FM, Podchaser, etc.)
+        # Try to extract audio URL from the page
+        success = extract_audio_from_page(url_to_download, output_name)
 
     if not success:
         print("[-] Download failed")
