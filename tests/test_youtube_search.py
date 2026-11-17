@@ -1,0 +1,94 @@
+"""YouTube search without API keys (podcast_alt_source.py).
+
+In November 2026 every YouTube Data API key answered HTTP 429, so the YouTube
+step found nothing and Spotify-only shows failed ("none of the 10 alternative
+sources is this episode") although the episode was on YouTube. The search now
+falls back to youtube.com's results page, which lists each video's length.
+
+Run: python3 -m unittest discover tests
+"""
+import json
+import os
+import sys
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+import podcast_alt_source as p  # noqa: E402
+
+
+def results_page(videos):
+    """A results page shaped like youtube.com's: ytInitialData holding videoRenderer entries."""
+    items = []
+    for v in videos:
+        renderer = {'videoId': v['id'], 'title': {'runs': [{'text': v['title']}]},
+                    'ownerText': {'runs': [{'text': v['channel']}]}}
+        if v.get('length'):
+            renderer['lengthText'] = {'simpleText': v['length']}
+        items.append({'videoRenderer': renderer})
+    data = {'contents': {'twoColumnSearchResultsRenderer': {'primaryContents': {
+        'sectionListRenderer': {'contents': [{'itemSectionRenderer': {'contents': items}}]}}}}}
+    return f'<html><script>var ytInitialData = {json.dumps(data)};</script></html>'
+
+
+EPISODE = {'id': 'aiHLXzeWY0M', 'title': 'Ep 6: The "Post Anxiety" of Social Anxiety',
+           'channel': 'Socially Blurred', 'length': '19:27'}
+
+
+class ParseResultsPage(unittest.TestCase):
+    def test_reads_id_title_channel_and_length_in_page_order(self):
+        page = results_page([EPISODE, {'id': 'x2', 'title': 'Long one', 'channel': 'C', 'length': '1:02:03'}])
+        self.assertEqual(p.parse_youtube_search_html(page), [
+            {'videoId': 'aiHLXzeWY0M', 'title': 'Ep 6: The "Post Anxiety" of Social Anxiety',
+             'channel': 'Socially Blurred', 'duration_seconds': 1167},
+            {'videoId': 'x2', 'title': 'Long one', 'channel': 'C', 'duration_seconds': 3723},
+        ])
+
+    def test_leaves_out_results_without_a_length_and_repeats(self):
+        page = results_page([{'id': 'live', 'title': 'Live now', 'channel': 'C'}, EPISODE, EPISODE])
+        self.assertEqual([v['videoId'] for v in p.parse_youtube_search_html(page)], ['aiHLXzeWY0M'])
+
+    def test_a_page_without_results_data_is_no_results(self):
+        self.assertEqual(p.parse_youtube_search_html('<html>consent</html>'), [])
+        self.assertEqual(p.parse_youtube_search_html('var ytInitialData = {broken;</script>'), [])
+        self.assertEqual(p.parse_youtube_search_html(None), [])
+
+
+class SearchFallsBackToResultsPage(unittest.TestCase):
+    def test_spent_api_keys_fall_back_to_the_results_page(self):
+        web = [{'videoId': 'aiHLXzeWY0M', 'title': EPISODE['title'], 'channel': 'Socially Blurred', 'duration_seconds': 1167}]
+        with mock.patch.object(p, 'YOUTUBE_API_KEYS', ['k1']), \
+             mock.patch.object(p, 'youtube_data_search', return_value=[]), \
+             mock.patch.object(p, 'youtube_web_search', return_value=web) as web_search, \
+             mock.patch('builtins.print'):
+            found = p.search_youtube('The "Post Anxiety" of Social Anxiety', 'Socially Blurred', 1166)
+        web_search.assert_called_once()
+        self.assertEqual(found[0]['url'], 'https://www.youtube.com/watch?v=aiHLXzeWY0M')
+        self.assertEqual(found[0]['duration_seconds'], 1167)
+        self.assertEqual(found[0]['show'], 'Socially Blurred')
+
+    def test_api_hits_without_lengths_also_fall_back(self):
+        api = [{'videoId': 'aiHLXzeWY0M', 'title': EPISODE['title'], 'channel': 'Socially Blurred', 'description': ''}]
+        web = [{'videoId': 'aiHLXzeWY0M', 'title': EPISODE['title'], 'channel': 'Socially Blurred', 'duration_seconds': 1167}]
+        with mock.patch.object(p, 'YOUTUBE_API_KEYS', ['k1']), \
+             mock.patch.object(p, 'youtube_data_search', return_value=api), \
+             mock.patch.object(p, 'youtube_data_video_durations', return_value={}), \
+             mock.patch.object(p, 'youtube_web_search', return_value=web), \
+             mock.patch('builtins.print'):
+            found = p.search_youtube('The "Post Anxiety" of Social Anxiety', 'Socially Blurred', 1166)
+        self.assertEqual(found[0]['duration_seconds'], 1167)
+
+    def test_working_api_keys_are_used_and_the_page_is_not_read(self):
+        api = [{'videoId': 'aiHLXzeWY0M', 'title': EPISODE['title'], 'channel': 'Socially Blurred', 'description': ''}]
+        with mock.patch.object(p, 'YOUTUBE_API_KEYS', ['k1']), \
+             mock.patch.object(p, 'youtube_data_search', return_value=api), \
+             mock.patch.object(p, 'youtube_data_video_durations', return_value={'aiHLXzeWY0M': 1167}), \
+             mock.patch.object(p, 'youtube_web_search') as web_search, \
+             mock.patch('builtins.print'):
+            found = p.search_youtube('The "Post Anxiety" of Social Anxiety', 'Socially Blurred', 1166)
+        web_search.assert_not_called()
+        self.assertEqual(found[0]['duration_seconds'], 1167)
+
+
+if __name__ == '__main__':
+    unittest.main()
