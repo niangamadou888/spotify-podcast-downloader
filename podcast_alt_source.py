@@ -203,6 +203,85 @@ def youtube_data_video_durations(video_ids: list) -> dict:
     return {}
 
 
+# YouTube's own results page, read when the Data API gives nothing: in
+# November 2026 all nine API keys answered HTTP 429 and the YouTube step found
+# no video at all, while the same search on youtube.com (from the same box,
+# no key) listed the episode first. The page carries each result's title,
+# channel and length in its ytInitialData.
+YOUTUBE_WEB_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+_YT_INITIAL_DATA = re.compile(r'var ytInitialData = (\{.*?\});</script>', re.S)
+
+
+def _yt_text(node) -> str:
+    """The text of a YouTube text node ({simpleText} or {runs: [{text}]})."""
+    if not isinstance(node, dict):
+        return ''
+    if 'simpleText' in node:
+        return node.get('simpleText') or ''
+    return ''.join(run.get('text', '') for run in node.get('runs', []) if isinstance(run, dict))
+
+
+def parse_youtube_search_html(page: str) -> list:
+    """Videos on a YouTube results page, in page order:
+    [{videoId, title, channel, duration_seconds}]. A result with no length
+    (a live stream, a short) is left out."""
+    match = _YT_INITIAL_DATA.search(page or '')
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group(1))
+    except ValueError:
+        return []
+    videos = []
+    seen = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            renderer = node.get('videoRenderer')
+            if isinstance(renderer, dict):
+                video_id = renderer.get('videoId')
+                length = _yt_text(renderer.get('lengthText'))
+                seconds = parse_duration_to_seconds(length) if length else 0
+                if video_id and seconds and video_id not in seen:
+                    seen.add(video_id)
+                    videos.append({
+                        'videoId': video_id,
+                        'title': _yt_text(renderer.get('title')),
+                        'channel': _yt_text(renderer.get('ownerText')) or _yt_text(renderer.get('longBylineText')),
+                        'duration_seconds': seconds,
+                    })
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(data)
+    return videos
+
+
+def youtube_web_search(query: str, max_results: int = 10) -> list:
+    """Videos for `query` from youtube.com's results page (no API key), with lengths."""
+    try:
+        resp = requests.get(
+            'https://www.youtube.com/results',
+            params={'search_query': query, 'sp': 'EgIQAQ=='},  # videos only
+            headers=YOUTUBE_WEB_HEADERS,
+            timeout=20,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f'[-] YouTube results page error: {e}')
+        return []
+    videos = parse_youtube_search_html(resp.text)[:max_results]
+    print(f'[+] YouTube results page: {len(videos)} videos')
+    return videos
+
+
 def _wait_for_rapidapi_render(progress_url: str, max_wait_seconds: int = 300) -> bool:
     """Listen on RapidAPI's SSE progress stream until completion (or stream close).
 
@@ -904,7 +983,8 @@ def search_podchaser(episode_title: str, show_name: str = None) -> list:
 
 
 def search_youtube(episode_title: str, show_name: str = None, target_duration: int = 0) -> list:
-    """Search YouTube via Data API v3, fetch durations in a single batch.
+    """Search YouTube via Data API v3, fetch durations in a single batch; when the
+    API gives nothing (no key left), read YouTube's results page instead.
 
     Bypasses pytubefix.Search() which trips YouTube bot-detection on datacenter IPs
     (Hetzner etc.). Returns sources flagged direct_audio=True because the chosen
@@ -912,19 +992,20 @@ def search_youtube(episode_title: str, show_name: str = None, target_duration: i
     """
     print("[*] Searching YouTube (Data API v3)...")
 
-    if not YOUTUBE_API_KEYS:
-        print("[-] Skipping YouTube: YOUTUBE_API_KEYS not configured")
-        return []
-
     search_query = f"{show_name} {episode_title}" if show_name else episode_title
     if 'podcast' not in search_query.lower():
         search_query = f"{search_query} podcast"
 
-    hits = youtube_data_search(search_query, max_results=10)
+    hits = youtube_data_search(search_query, max_results=10) if YOUTUBE_API_KEYS else []
+    duration_map = youtube_data_video_durations([h['videoId'] for h in hits]) if hits else {}
+    if not any(duration_map.get(h['videoId']) for h in hits):
+        # No key configured, every key spent, or no lengths: YouTube's own
+        # results page, which gives the lengths with the videos.
+        print("[*] Searching YouTube (results page, no API key)...")
+        hits = youtube_web_search(search_query, max_results=10)
+        duration_map = {h['videoId']: h['duration_seconds'] for h in hits}
     if not hits:
         return []
-
-    duration_map = youtube_data_video_durations([h['videoId'] for h in hits])
 
     stopwords = {'the', 'and', 'for', 'a', 'an', 'of', 'to', 'in', 'on', 'with', 'podcast'}
     search_terms = [t for t in episode_title.lower().split() if len(t) > 2 and t not in stopwords]
