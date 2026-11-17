@@ -17,15 +17,320 @@ The script searches these platforms and matches episodes by duration.
 
 import subprocess
 import json
+import os
 import re
 import sys
+import time
 import argparse
 import urllib.parse
 import html as html_module
+from threading import Lock
 import requests
 from bs4 import BeautifulSoup
-from pytubefix import YouTube, Search
-from pytubefix.exceptions import PytubeFixError
+
+try:
+    from pytubefix import YouTube, Search
+    from pytubefix.exceptions import PytubeFixError
+    HAS_PYTUBEFIX = True
+except ImportError:
+    HAS_PYTUBEFIX = False
+    YouTube = None
+    Search = None
+    class PytubeFixError(Exception):
+        pass
+
+
+def _load_env_file() -> None:
+    """Load KEY=VALUE pairs from .env next to this script, without overriding existing env."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, 'r', encoding='utf-8') as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
+_load_env_file()
+
+
+YOUTUBE_API_KEYS: list = [
+    k.strip()
+    for k in (os.environ.get('YOUTUBE_API_KEYS') or os.environ.get('YOUTUBE_API_KEY', '')).split(',')
+    if k.strip()
+]
+RAPIDAPI_MP3_KEYS: list = [
+    k.strip()
+    for k in (os.environ.get('RAPIDAPI_MP3_KEYS') or os.environ.get('RAPIDAPI_MP3_KEY', '')).split(',')
+    if k.strip()
+]
+RAPIDAPI_MP3_HOST: str = os.environ.get('RAPIDAPI_MP3_HOST', 'youtube-mp3-2025.p.rapidapi.com')
+KEY_COOLDOWN_SECONDS: int = int(os.environ.get('API_KEY_COOLDOWN_SECONDS', '3600'))
+
+
+class _KeyRotator:
+    """Sequential key rotator with cooldown on quota/429 — mirrors tubemusic-io behavior."""
+
+    def __init__(self, keys: list, name: str = 'rotator') -> None:
+        self.name = name
+        self.keys = list(keys)
+        self.cooldowns: dict = {k: 0.0 for k in self.keys}
+        self.idx = 0
+        self.lock = Lock()
+
+    def size(self) -> int:
+        return len(self.keys)
+
+    def current(self):
+        """Return next available (non-cooled) key, or None if all cooled / no keys."""
+        with self.lock:
+            if not self.keys:
+                return None
+            now = time.time()
+            for i in range(len(self.keys)):
+                k = self.keys[(self.idx + i) % len(self.keys)]
+                if self.cooldowns.get(k, 0.0) <= now:
+                    self.idx = (self.idx + i) % len(self.keys)
+                    return k
+            return None
+
+    def cool(self, key, seconds: int = KEY_COOLDOWN_SECONDS) -> None:
+        with self.lock:
+            self.cooldowns[key] = time.time() + seconds
+            try:
+                cur = self.keys.index(key)
+                self.idx = (cur + 1) % len(self.keys)
+            except ValueError:
+                pass
+
+
+_yt_rotator = _KeyRotator(YOUTUBE_API_KEYS, name='youtube')
+_rapid_rotator = _KeyRotator(RAPIDAPI_MP3_KEYS, name='rapidapi-mp3')
+
+
+def _key_tail(key: str) -> str:
+    """Last 4 chars of a key for non-sensitive logging."""
+    return key[-4:] if key and len(key) >= 4 else '????'
+
+
+def youtube_data_search(query: str, max_results: int = 10) -> list:
+    """YouTube Data API v3 search.list — returns list of {videoId, title, channel, description}."""
+    if not YOUTUBE_API_KEYS:
+        print('[-] YouTube Data API: YOUTUBE_API_KEYS not configured')
+        return []
+    attempts = max(1, _yt_rotator.size())
+    for _ in range(attempts):
+        key = _yt_rotator.current()
+        if not key:
+            print('[-] YouTube Data API: all keys cooled down')
+            return []
+        try:
+            resp = requests.get(
+                'https://www.googleapis.com/youtube/v3/search',
+                params={
+                    'part': 'snippet',
+                    'q': query,
+                    'type': 'video',
+                    'maxResults': max_results,
+                    'key': key,
+                },
+                timeout=15,
+            )
+            if resp.status_code in (403, 429):
+                print(f'[-] YouTube key …{_key_tail(key)} cooled (HTTP {resp.status_code})')
+                _yt_rotator.cool(key)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            results = []
+            for item in data.get('items', []):
+                vid = (item.get('id') or {}).get('videoId')
+                if not vid:
+                    continue
+                sn = item.get('snippet') or {}
+                results.append({
+                    'videoId': vid,
+                    'title': sn.get('title', '') or '',
+                    'channel': sn.get('channelTitle', '') or '',
+                    'description': sn.get('description', '') or '',
+                })
+            return results
+        except requests.RequestException as e:
+            print(f'[-] YouTube search HTTP error: {e}')
+            continue
+    return []
+
+
+def youtube_data_video_durations(video_ids: list) -> dict:
+    """Batch fetch durations (seconds) for up to 50 videoIds via videos.list?part=contentDetails."""
+    if not video_ids or not YOUTUBE_API_KEYS:
+        return {}
+    attempts = max(1, _yt_rotator.size())
+    for _ in range(attempts):
+        key = _yt_rotator.current()
+        if not key:
+            return {}
+        try:
+            resp = requests.get(
+                'https://www.googleapis.com/youtube/v3/videos',
+                params={'part': 'contentDetails', 'id': ','.join(video_ids[:50]), 'key': key},
+                timeout=15,
+            )
+            if resp.status_code in (403, 429):
+                print(f'[-] YouTube key …{_key_tail(key)} cooled (HTTP {resp.status_code})')
+                _yt_rotator.cool(key)
+                continue
+            resp.raise_for_status()
+            out = {}
+            for item in resp.json().get('items', []):
+                vid = item.get('id')
+                dur = (item.get('contentDetails') or {}).get('duration', '')
+                if vid:
+                    out[vid] = parse_duration_to_seconds(dur)
+            return out
+        except requests.RequestException as e:
+            print(f'[-] YouTube videos HTTP error: {e}')
+            continue
+    return {}
+
+
+def _wait_for_rapidapi_render(progress_url: str, max_wait_seconds: int = 300) -> bool:
+    """Listen on RapidAPI's SSE progress stream until completion (or stream close).
+
+    Upstream emits SSE bytes such as `event:progress data:{"progress":42,...}` and
+    eventually `event:completed` / `"status":"success"`. We treat either an explicit
+    success marker OR the stream closing cleanly as render-finished — the actual
+    download attempt is also wrapped in retries by the caller, so a premature close
+    just costs a couple of extra retries on the file URL.
+    """
+    if not progress_url:
+        return True
+    deadline = time.time() + max_wait_seconds
+    try:
+        with requests.get(progress_url, stream=True, timeout=(15, max_wait_seconds)) as resp:
+            if resp.status_code >= 400:
+                print(f"[-] RapidAPI progress endpoint HTTP {resp.status_code} — proceeding to download anyway")
+                return True
+            tail = ''
+            for raw in resp.iter_lines(decode_unicode=True):
+                if raw is None:
+                    if time.time() > deadline:
+                        return True
+                    continue
+                tail = (tail + raw)[-4096:]
+                if '"status":"success"' in tail or 'event:completed' in tail or 'event: completed' in tail:
+                    time.sleep(2.0)
+                    return True
+                if time.time() > deadline:
+                    return True
+            # Stream ended without explicit success marker — treat as done; download retries cover it
+            return True
+    except requests.RequestException as e:
+        # Premature close is common — the file is probably ready by now anyway
+        print(f"[*] RapidAPI progress stream closed ({e}) — proceeding to download")
+        return True
+
+
+def download_rapidapi_audio(link: str, output_name: str, max_attempts: int = 6) -> bool:
+    """Download an audio file from a RapidAPI CDN URL with retries while it renders.
+
+    Returns True on success. The CDN returns 5xx while the file is still being
+    encoded; we back off exponentially (3s, 6s, 12s, 24s, 48s) before giving up.
+    """
+    if not link:
+        return False
+    ext = 'mp3'
+    for candidate in ('m4a', 'mp4', 'aac', 'ogg'):
+        if f'ext={candidate}' in link.lower() or f'.{candidate}' in link.lower():
+            ext = candidate
+            break
+    output_file = f"{output_name}.{ext}"
+
+    delay = 3
+    for attempt in range(1, max_attempts + 1):
+        print(f"[*] Downloading from RapidAPI CDN (attempt {attempt}/{max_attempts})...")
+        try:
+            with requests.get(
+                link,
+                stream=True,
+                timeout=(15, 600),
+                headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'},
+            ) as resp:
+                if resp.status_code >= 500 or resp.status_code == 404:
+                    print(f"[-] HTTP {resp.status_code} — file not ready yet, waiting {delay}s...")
+                    time.sleep(delay)
+                    delay = min(delay * 2, 60)
+                    continue
+                resp.raise_for_status()
+                total_bytes = 0
+                with open(output_file, 'wb') as fh:
+                    for chunk in resp.iter_content(chunk_size=1 << 16):
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        total_bytes += len(chunk)
+                if total_bytes < 1024:
+                    print(f"[-] Downloaded only {total_bytes} bytes — likely an error page, retrying...")
+                    try:
+                        os.remove(output_file)
+                    except OSError:
+                        pass
+                    time.sleep(delay)
+                    delay = min(delay * 2, 60)
+                    continue
+                print(f"[+] Saved {total_bytes} bytes to: {output_file}")
+                return True
+        except requests.RequestException as e:
+            print(f"[-] Download error (attempt {attempt}): {e}")
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+    print("[-] RapidAPI download exhausted retries")
+    return False
+
+
+def rapidapi_youtube_audio(video_id: str, ext: str = 'mp3') -> dict:
+    """Resolve YouTube videoId to direct audio via RapidAPI youtube-mp3-2025.
+
+    Returns the raw response dict (with linkDownload, title, lengthSeconds, ...) or None.
+    """
+    if not RAPIDAPI_MP3_KEYS:
+        print('[-] RapidAPI MP3: RAPIDAPI_MP3_KEYS not configured')
+        return None
+    attempts = max(1, _rapid_rotator.size())
+    for _ in range(attempts):
+        key = _rapid_rotator.current()
+        if not key:
+            print('[-] RapidAPI MP3: all keys cooled down')
+            return None
+        try:
+            resp = requests.get(
+                f'https://{RAPIDAPI_MP3_HOST}/v1/social/youtube/audio',
+                params={'id': video_id, 'ext': ext},
+                headers={
+                    'x-rapidapi-key': key,
+                    'x-rapidapi-host': RAPIDAPI_MP3_HOST,
+                },
+                timeout=30,
+            )
+            if resp.status_code == 429:
+                print(f'[-] RapidAPI key …{_key_tail(key)} cooled (HTTP 429)')
+                _rapid_rotator.cool(key)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            print(f'[-] RapidAPI MP3 error: {e}')
+            continue
+    return None
 
 
 # Known RaiPlay Sound show mappings
@@ -107,9 +412,16 @@ def format_duration(seconds: int) -> str:
 
 
 def duration_matches(source_seconds: int, target_seconds: int, tolerance: int = 90) -> bool:
-    """Check if durations match within tolerance (default 90 seconds)."""
-    if source_seconds == 0 or target_seconds == 0:
-        return True  # Can't compare, assume match
+    """Check if durations match within tolerance (default 90 seconds).
+
+    Unknown source duration (0) is NOT treated as a match — previously this caused
+    silent wrong-episode downloads when a Fyyd hit with no duration metadata was
+    auto-selected. Target duration unknown is still treated as 'can't compare'.
+    """
+    if source_seconds == 0:
+        return False
+    if target_seconds == 0:
+        return True  # Can't compare from target side — keep the candidate
     return abs(source_seconds - target_seconds) <= tolerance
 
 
@@ -592,78 +904,58 @@ def search_podchaser(episode_title: str, show_name: str = None) -> list:
 
 
 def search_youtube(episode_title: str, show_name: str = None, target_duration: int = 0) -> list:
-    """Search YouTube for podcast episodes using pytube."""
-    print(f"[*] Searching YouTube...")
+    """Search YouTube via Data API v3, fetch durations in a single batch.
 
-    results = []
+    Bypasses pytubefix.Search() which trips YouTube bot-detection on datacenter IPs
+    (Hetzner etc.). Returns sources flagged direct_audio=True because the chosen
+    candidate is later resolved to a direct MP3 URL via RapidAPI at download time.
+    """
+    print("[*] Searching YouTube (Data API v3)...")
 
-    # Build search query - include "podcast" to improve results
-    search_query = episode_title
-    if show_name:
-        search_query = f"{show_name} {episode_title}"
+    if not YOUTUBE_API_KEYS:
+        print("[-] Skipping YouTube: YOUTUBE_API_KEYS not configured")
+        return []
 
-    # Add "podcast" if not already in query to get better results
+    search_query = f"{show_name} {episode_title}" if show_name else episode_title
     if 'podcast' not in search_query.lower():
         search_query = f"{search_query} podcast"
 
-    try:
-        # Use pytube to search YouTube
-        search = Search(search_query)
-        search_results = search.results[:10]  # Get up to 10 results
+    hits = youtube_data_search(search_query, max_results=10)
+    if not hits:
+        return []
 
-        if not search_results:
-            return []
+    duration_map = youtube_data_video_durations([h['videoId'] for h in hits])
 
-        # Normalize search terms for matching
-        search_terms = episode_title.lower().split()
-        stopwords = ['the', 'and', 'for', 'a', 'an', 'of', 'to', 'in', 'on', 'with', 'podcast']
-        search_terms = [t for t in search_terms if len(t) > 2 and t not in stopwords]
+    stopwords = {'the', 'and', 'for', 'a', 'an', 'of', 'to', 'in', 'on', 'with', 'podcast'}
+    search_terms = [t for t in episode_title.lower().split() if len(t) > 2 and t not in stopwords]
+    show_lower = (show_name or '').lower()
 
-        for video in search_results:
-            try:
-                video_id = video.video_id
-                title = video.title or ''
-                duration_seconds = video.length or 0
-                channel = video.author or ''
+    results = []
+    for hit in hits:
+        title = decode_html_entities(hit['title'])
+        channel = hit['channel']
+        video_id = hit['videoId']
+        duration_seconds = int(duration_map.get(video_id, 0))
 
-                if not video_id or not title:
-                    continue
+        title_lower = title.lower()
+        match_count = sum(1 for term in search_terms if term in title_lower)
+        if show_lower and show_lower in channel.lower():
+            match_count += 2
 
-                # Calculate match score
-                title_lower = title.lower()
-                match_count = sum(1 for term in search_terms if term in title_lower)
+        results.append({
+            'title': title,
+            'show': channel,
+            'url': f"https://www.youtube.com/watch?v={video_id}",
+            'video_id': video_id,
+            'duration': format_duration(duration_seconds),
+            'duration_seconds': duration_seconds,
+            'platform': 'youtube',
+            'match_score': match_count,
+            'direct_audio': True,
+        })
 
-                # Bonus for channel name matching show name
-                if show_name and show_name.lower() in channel.lower():
-                    match_count += 2
-
-                video_url = f"https://www.youtube.com/watch?v={video_id}"
-
-                results.append({
-                    'title': title,
-                    'show': channel,
-                    'url': video_url,
-                    'duration': format_duration(duration_seconds),
-                    'duration_seconds': duration_seconds,
-                    'platform': 'youtube',
-                    'match_score': match_count,
-                    'direct_audio': False
-                })
-
-            except Exception:
-                continue
-
-        # Sort by match score
-        results.sort(key=lambda x: x.get('match_score', 0), reverse=True)
-
-        if results:
-            print(f"[+] Found {len(results)} YouTube results")
-
-    except PytubeFixError as e:
-        print(f"[-] YouTube search error: {e}")
-    except Exception as e:
-        print(f"[-] YouTube search error: {e}")
-
+    results.sort(key=lambda x: x.get('match_score', 0), reverse=True)
+    print(f"[+] Found {len(results)} YouTube results")
     return results[:10]
 
 
@@ -1241,11 +1533,34 @@ Supported platforms (all free, no API keys):
         # RaiPlaySound needs special handling to extract audio URL
         success = download_raiplaysound(url_to_download, output_name)
     elif download_source['platform'] == 'youtube':
-        # YouTube - use pytube (only platform that uses pytube)
+        # YouTube - resolve videoId → direct MP3 URL via RapidAPI (bypasses YT bot detection).
+        # Fall back to pytubefix only for --with-video which needs subtitle handling.
         if args.with_video:
-            success = download_video_with_subs(url_to_download, output_name)
+            if not HAS_PYTUBEFIX:
+                print("[-] --with-video requires pytubefix to be installed")
+                success = False
+            else:
+                success = download_video_with_subs(url_to_download, output_name)
         else:
-            success = download_with_pytube(url_to_download, output_name)
+            video_id = download_source.get('video_id')
+            if not video_id:
+                m = re.search(r'v=([\w-]+)', url_to_download)
+                video_id = m.group(1) if m else None
+            success = False
+            if video_id:
+                print("[*] Resolving YouTube audio via RapidAPI...")
+                rapid = rapidapi_youtube_audio(video_id, ext='mp3')
+                link = (rapid or {}).get('linkDownload') or (rapid or {}).get('linkStream')
+                progress = (rapid or {}).get('linkDownloadProgress')
+                if link:
+                    print("[*] Waiting for RapidAPI render to finish...")
+                    _wait_for_rapidapi_render(progress)
+                    success = download_rapidapi_audio(link, output_name)
+                else:
+                    print("[-] RapidAPI did not return a download link")
+            if not success and HAS_PYTUBEFIX:
+                print("[*] Falling back to pytubefix for YouTube download...")
+                success = download_with_pytube(url_to_download, output_name)
     elif is_direct_audio:
         # Direct audio URL (e.g., from Fyyd)
         success = download_direct_audio(url_to_download, output_name)
