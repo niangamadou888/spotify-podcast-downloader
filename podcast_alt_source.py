@@ -282,6 +282,38 @@ def youtube_web_search(query: str, max_results: int = 10) -> list:
     return videos
 
 
+def youtube_ytdlp_search(query: str, max_results: int = 10) -> list:
+    """Videos for `query` through yt-dlp's YouTube search (no API key), with
+    lengths: the second fallback, for when the results page gives nothing (an
+    error, or a layout change yt-dlp's maintainers have already caught up with)."""
+    cmd = [
+        'yt-dlp', '--no-update', '--no-warnings', '--flat-playlist',
+        '--print', '%(id)s\t%(duration)s\t%(channel)s\t%(title)s',
+        f'ytsearch{max_results}:{query}',
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f'[-] yt-dlp search error: {e}')
+        return []
+    if out.returncode != 0:
+        print(f'[-] yt-dlp search error: exit {out.returncode} {(out.stderr or "").strip()[:200]}')
+    videos = []
+    for line in (out.stdout or '').splitlines():
+        parts = line.split('\t', 3)
+        if len(parts) != 4:
+            continue
+        video_id, duration, channel, title = parts
+        try:
+            seconds = int(float(duration))
+        except ValueError:
+            continue
+        if video_id and seconds > 0:
+            videos.append({'videoId': video_id, 'title': title, 'channel': channel, 'duration_seconds': seconds})
+    print(f'[+] yt-dlp search: {len(videos)} videos')
+    return videos
+
+
 def _wait_for_rapidapi_render(progress_url: str, max_wait_seconds: int = 300) -> bool:
     """Listen on RapidAPI's SSE progress stream until completion (or stream close).
 
@@ -984,7 +1016,8 @@ def search_podchaser(episode_title: str, show_name: str = None) -> list:
 
 def search_youtube(episode_title: str, show_name: str = None, target_duration: int = 0) -> list:
     """Search YouTube via Data API v3, fetch durations in a single batch; when the
-    API gives nothing (no key left), read YouTube's results page instead.
+    API gives nothing (no key left), read YouTube's results page instead, and
+    when that gives nothing either, yt-dlp's search.
 
     Bypasses pytubefix.Search() which trips YouTube bot-detection on datacenter IPs
     (Hetzner etc.). Returns sources flagged direct_audio=True because the chosen
@@ -1003,6 +1036,9 @@ def search_youtube(episode_title: str, show_name: str = None, target_duration: i
         # results page, which gives the lengths with the videos.
         print("[*] Searching YouTube (results page, no API key)...")
         hits = youtube_web_search(search_query, max_results=10)
+        if not hits:
+            print("[*] Searching YouTube (yt-dlp, no API key)...")
+            hits = youtube_ytdlp_search(search_query, max_results=10)
         duration_map = {h['videoId']: h['duration_seconds'] for h in hits}
     if not hits:
         return []

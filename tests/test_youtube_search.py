@@ -90,5 +90,52 @@ class SearchFallsBackToResultsPage(unittest.TestCase):
         self.assertEqual(found[0]['duration_seconds'], 1167)
 
 
+
+class YtDlpSearch(unittest.TestCase):
+    """yt-dlp's YouTube search: the second fallback when the results page gives
+    nothing (an error, or a page whose layout changed)."""
+
+    def run_result(self, stdout, returncode=0):
+        return mock.Mock(stdout=stdout, stderr='', returncode=returncode)
+
+    def test_reads_id_length_channel_and_title(self):
+        out = ('aiHLXzeWY0M\t1167\tSocially Blurred\tEp 6: The "Post Anxiety" of Social Anxiety\n'
+               'NA_ID\tNA\tSomeone\tA live stream\n'
+               'x2\t3723.0\tC\tTitle\twith a tab\n')
+        with mock.patch.object(p.subprocess, 'run', return_value=self.run_result(out)) as run, \
+             mock.patch('builtins.print'):
+            videos = p.youtube_ytdlp_search('Socially Blurred podcast', max_results=5)
+        self.assertEqual(videos, [
+            {'videoId': 'aiHLXzeWY0M', 'title': 'Ep 6: The "Post Anxiety" of Social Anxiety',
+             'channel': 'Socially Blurred', 'duration_seconds': 1167},
+            {'videoId': 'x2', 'title': 'Title\twith a tab', 'channel': 'C', 'duration_seconds': 3723},
+        ])
+        args = run.call_args.args[0]
+        self.assertEqual(args[0], 'yt-dlp')
+        self.assertEqual(args[-1], 'ytsearch5:Socially Blurred podcast', 'the query is one argument, no shell')
+
+    def test_a_missing_or_failing_yt_dlp_is_no_results(self):
+        with mock.patch.object(p.subprocess, 'run', side_effect=FileNotFoundError('yt-dlp')), mock.patch('builtins.print'):
+            self.assertEqual(p.youtube_ytdlp_search('q'), [])
+        with mock.patch.object(p.subprocess, 'run', side_effect=p.subprocess.TimeoutExpired('yt-dlp', 90)), \
+             mock.patch('builtins.print'):
+            self.assertEqual(p.youtube_ytdlp_search('q'), [])
+
+    def test_used_only_when_the_results_page_gives_nothing(self):
+        found = [{'videoId': 'aiHLXzeWY0M', 'title': EPISODE['title'], 'channel': 'Socially Blurred', 'duration_seconds': 1167}]
+        with mock.patch.object(p, 'YOUTUBE_API_KEYS', []), \
+             mock.patch.object(p, 'youtube_web_search', return_value=[]), \
+             mock.patch.object(p, 'youtube_ytdlp_search', return_value=found) as ytdlp, \
+             mock.patch('builtins.print'):
+            results = p.search_youtube('The "Post Anxiety" of Social Anxiety', 'Socially Blurred', 1166)
+        ytdlp.assert_called_once()
+        self.assertEqual(results[0]['duration_seconds'], 1167)
+        with mock.patch.object(p, 'YOUTUBE_API_KEYS', []), \
+             mock.patch.object(p, 'youtube_web_search', return_value=found), \
+             mock.patch.object(p, 'youtube_ytdlp_search') as ytdlp, \
+             mock.patch('builtins.print'):
+            p.search_youtube('The "Post Anxiety" of Social Anxiety', 'Socially Blurred', 1166)
+        ytdlp.assert_not_called()
+
 if __name__ == '__main__':
     unittest.main()
